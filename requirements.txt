@@ -5,7 +5,5 @@ pillow==10.3.0
 python-multipart==0.0.9
 pydicom==2.4.4
 opencv-python==4.9.0.80
-
-# Torch CPU (match Ultralytics nicely; if deploy to GPU later, change these)
-torch==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu
-torchvision==0.20.1+cpu --index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+torchvision==0.15.2
