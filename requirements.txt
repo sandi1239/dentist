@@ -6,4 +6,4 @@ python-multipart==0.0.9
 pydicom==2.4.4
 opencv-python==4.9.0.80
 torch==2.5.1
-torchvision==0.15.2
+torchvision==0.20.1
