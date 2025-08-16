@@ -1,25 +1,18 @@
-# Use official lightweight Python image
 FROM python:3.10-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies (needed for opencv, pillow, torch)
-RUN apt-get update && apt-get install -y \
-    libgl1 \
+# Only what we need for headless OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency file and install
-COPY requirements.txt .
+RUN python -m pip install --upgrade pip setuptools wheel
 
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy project files
-COPY . .
+COPY . /app
 
-# Expose port
 EXPOSE 8000
-
-# Start command for Railway
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
