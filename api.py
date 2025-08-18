@@ -1,5 +1,5 @@
 import io, os, uuid, numpy as np
-from typing import Literal, Dict
+from typing import Literal, Dict, Tuple
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
@@ -14,7 +14,7 @@ try:
 except Exception:
     pydicom = None
 
-import cv2  # drawing/saving
+import cv2
 
 APP_TITLE = "Dental X-ray AI – Dentist-Friendly"
 STATIC_DIR = "static"
@@ -23,28 +23,26 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 app = FastAPI(title=APP_TITLE)
 
 # ---------------- CORS ----------------
-# Explicitly allow your Lovable origins (preview + prod + project domain).
 ALLOWED_ORIGINS = [
     "https://preview--dental-scan-analyzer.lovable.app",
     "https://dental-scan-analyzer.lovable.app",
     "https://bcfe2fae-0c0f-4493-96b6-4f09ed047686.lovableproject.com",
 ]
-# Optionally allow any *.lovable.app or *.lovableproject.com via regex:
 ALLOW_ORIGIN_REGEX = r"^https:\/\/([a-z0-9-]+\.)?(lovable(app|project)\.com)$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,     # list of exact origins
-    allow_origin_regex=ALLOW_ORIGIN_REGEX,  # plus wildcard for subdomains
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],  # includes Content-Type, Authorization, etc.
+    allow_headers=["*"],
 )
 
-# Static files (annotated images). CORS middleware applies to these, too.
+# Static files
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ---- Per-class thresholds (tune per feedback) ----
+# ---- Per-class thresholds ----
 PER_CLASS_THRESH: Dict[str, float] = {
     "caries": 0.40,
     "bone loss": 0.45,
@@ -99,6 +97,16 @@ def mode_params(mode: str):
         "high_precision":{"iou": 0.45},
     }.get(mode, {"iou": 0.50})
 
+def parse_color(val: str, default: Tuple[int,int,int]) -> Tuple[int,int,int]:
+    """Parse 'r,g,b' string into tuple."""
+    try:
+        parts = [int(x.strip()) for x in val.split(",")]
+        if len(parts) == 3:
+            return tuple(parts)
+    except Exception:
+        pass
+    return default
+
 # ---- Load model ----
 try:
     MODEL = YOLO("best.pt")
@@ -123,18 +131,27 @@ def _text_scale(img_w):
     if img_w >= 1200: return 0.7, 2
     return 0.6, 1
 
+# ---- Detect Endpoint ----
 @app.post("/detect")
 async def detect(
     file: UploadFile = File(...),
     mode: Literal["balanced","high_recall","high_precision"] = Query("balanced"),
-    imgsz: int = Query(1024, ge=512, le=3072),  # 1024 default is friendlier on free tiers
+    imgsz: int = Query(1024, ge=512, le=3072),
     enhance: bool = Query(True),
-    use_augment: bool = Query(False, description="Ultralytics augment=True (mild recall boost)"),
-    min_show: float = Query(0.12, ge=0.0, le=1.0, description="Minimum score to show dashed low-suggestions"),
-    topk_fallback: int = Query(3, ge=0, le=10, description="If nothing passes thresholds, show up to K low-suggestions"),
+    use_augment: bool = Query(False),
+    min_show: float = Query(0.12, ge=0.0, le=1.0),
+    topk_fallback: int = Query(3, ge=0, le=10),
+    show_levels: str = Query("high,medium,low"),
+    color_high: str = Query("0,255,0", description="RGB for high confidence boxes"),
+    color_medium: str = Query("0,165,255", description="RGB for medium confidence boxes"),
+    color_low: str = Query("180,180,180", description="RGB for low confidence boxes"),
 ):
+    """
+    Run detection and draw bounding boxes.
+    Box colors configurable via ?color_high=R,G,B etc.
+    """
     if MODEL is None:
-        raise HTTPException(500, "Model not loaded. Ensure best.pt is present and valid.")
+        raise HTTPException(500, "Model not loaded. Ensure best.pt is present.")
 
     try:
         pil = load_upload(file)
@@ -165,8 +182,7 @@ async def detect(
     def id2name(ci:int) -> str:
         return names.get(int(ci), str(int(ci)))
 
-    cand = []
-    top_scores = []
+    cand, top_scores = [], []
     if res.boxes is not None and len(res.boxes):
         xyxy = res.boxes.xyxy.cpu().numpy()
         confs = res.boxes.conf.cpu().numpy()
@@ -184,14 +200,10 @@ async def detect(
 
     high, med, low = [], [], []
     for c in cand:
-        sc = c["raw"]["conf"]
-        thr = c["raw"]["thr"]
-        if sc >= max(0.8, thr + 0.20):
-            high.append(c)
-        elif sc >= thr:
-            med.append(c)
-        elif sc >= min_show:
-            low.append(c)
+        sc, thr = c["raw"]["conf"], c["raw"]["thr"]
+        if sc >= max(0.8, thr + 0.20): high.append(c)
+        elif sc >= thr: med.append(c)
+        elif sc >= min_show: low.append(c)
 
     lowered = False
     if not high and not med and topk_fallback > 0 and cand:
@@ -199,6 +211,11 @@ async def detect(
                      key=lambda z: z["raw"]["conf"], reverse=True)[:topk_fallback]
         low = tmp
         lowered = True
+
+    show_set = {s.strip().lower() for s in show_levels.split(",") if s.strip()}
+    color_high = parse_color(color_high, (0,255,0))
+    color_medium = parse_color(color_medium, (0,165,255))
+    color_low = parse_color(color_low, (180,180,180))
 
     canvas = base.copy()
     scale, thick = _text_scale(W)
@@ -216,9 +233,12 @@ async def detect(
         cv2.rectangle(canvas, (x1, ytxt - th - 4), (x1 + tw + 6, ytxt), color, -1)
         cv2.putText(canvas, label, (x1 + 3, ytxt - 4), font, scale, (0,0,0), thick, cv2.LINE_AA)
 
-    for b in high: draw_box(b, (0,255,0), solid=True)
-    for b in med:  draw_box(b, (0,165,255), solid=True)   # orange (BGR)
-    for b in low:  draw_box(b, (180,180,180), solid=False)
+    if "high" in show_set:
+        for b in high: draw_box(b, color_high, solid=True)
+    if "medium" in show_set:
+        for b in med:  draw_box(b, color_medium, solid=True)
+    if "low" in show_set:
+        for b in low:  draw_box(b, color_low, solid=False)
 
     filename = f"{uuid.uuid4()}.png"
     outpath = os.path.join(STATIC_DIR, filename)
@@ -226,9 +246,7 @@ async def detect(
 
     def to_out(b):
         x1,y1,x2,y2 = b["raw"]["x1"], b["raw"]["y1"], b["raw"]["x2"], b["raw"]["y2"]
-        conf = b["raw"]["conf"]
-        cname = b["raw"]["class_name"]
-        cid = b["raw"]["class_id"]
+        conf, cname, cid = b["raw"]["conf"], b["raw"]["class_name"], b["raw"]["class_id"]
         return {
             "class_id": cid,
             "class_name": cname,
@@ -249,6 +267,8 @@ async def detect(
             "mode": mode, "imgsz": imgsz, "enhance": enhance, "augment": use_augment,
             "iou": iou, "min_show": min_show, "topk_fallback": topk_fallback,
             "per_class_thresholds": PER_CLASS_THRESH,
+            "show_levels": list(show_set),
+            "colors": {"high": color_high, "medium": color_medium, "low": color_low},
         },
         "debug": {"top_raw_conf_scores": top_scores, "fallback_used": lowered}
     }
@@ -260,4 +280,4 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "2025-08-18-02"}
+    return {"version": "2025-08-18-04"}
