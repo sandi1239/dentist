@@ -3,6 +3,7 @@ from typing import Literal, Dict
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from ultralytics import YOLO
 
@@ -20,10 +21,21 @@ STATIC_DIR = "static"
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 app = FastAPI(title=APP_TITLE)
+
+# ✅ CORS middleware so your Lovable frontend can call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",  # or explicitly list: "https://preview--dental-scan-analyzer.lovable.app", "https://dental-scan-analyzer.lovable.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ---- Per-class clinical thresholds (tune later per feedback) ----
-# Names must match the model's class names (case-insensitive matching below).
 PER_CLASS_THRESH: Dict[str, float] = {
     "caries": 0.40,
     "bone loss": 0.45,
@@ -86,23 +98,17 @@ except Exception as e:
     MODEL = None
 
 def _draw_dashed_rect(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
-    # simple dashed rectangle
     x1, y1 = pt1; x2, y2 = pt2
-    # top
     for x in range(x1, x2, dash_len + gap_len):
         cv2.line(img, (x, y1), (min(x + dash_len, x2), y1), color, thickness)
-    # bottom
     for x in range(x1, x2, dash_len + gap_len):
         cv2.line(img, (x, y2), (min(x + dash_len, x2), y2), color, thickness)
-    # left
     for y in range(y1, y2, dash_len + gap_len):
         cv2.line(img, (x1, y), (x1, min(y + dash_len, y2)), color, thickness)
-    # right
     for y in range(y1, y2, dash_len + gap_len):
         cv2.line(img, (x2, y), (x2, min(y + dash_len, y2)), color, thickness)
 
 def _text_scale(img_w):
-    # scale text size based on image width
     if img_w >= 3000: return 1.0, 2
     if img_w >= 2000: return 0.8, 2
     if img_w >= 1200: return 0.7, 2
@@ -114,31 +120,28 @@ async def detect(
     mode: Literal["balanced","high_recall","high_precision"] = Query("balanced"),
     imgsz: int = Query(1536, ge=512, le=3072),
     enhance: bool = Query(True),
-    use_augment: bool = Query(False, description="Ultralytics augment=True (mild recall boost)"),
-    min_show: float = Query(0.12, ge=0.0, le=1.0, description="Minimum score to show dashed low-suggestions"),
-    topk_fallback: int = Query(3, ge=0, le=10, description="If nothing passes thresholds, show up to K low-suggestions"),
+    use_augment: bool = Query(False),
+    min_show: float = Query(0.12, ge=0.0, le=1.0),
+    topk_fallback: int = Query(3, ge=0, le=10),
 ):
     if MODEL is None:
         raise HTTPException(500, "Model not loaded. Ensure best.pt is present and valid.")
 
-    # 1) Load image
     try:
         pil = load_upload(file)
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
-    # 2) Optional contrast enhancement (helpful for X-rays)
     pil = maybe_enhance(pil, enable=enhance)
-    base = np.array(pil)  # RGB
+    base = np.array(pil)
     H, W = base.shape[:2]
 
-    # 3) Predict once with very low conf to collect everything; filter ourselves
     iou = mode_params(mode)["iou"]
     try:
         res = MODEL.predict(
             source=pil,
             imgsz=imgsz,
-            conf=0.001,          # collect all candidates
+            conf=0.001,
             iou=iou,
             device="cpu",
             agnostic_nms=True,
@@ -150,11 +153,9 @@ async def detect(
         raise HTTPException(500, f"Inference failed: {e}")
 
     names = res.names or {}
-    # reverse map in case model uses IDs
     def id2name(ci:int) -> str:
         return names.get(int(ci), str(int(ci)))
 
-    # 4) Build candidates
     cand = []
     top_scores = []
     if res.boxes is not None and len(res.boxes):
@@ -165,14 +166,13 @@ async def detect(
         for box, sc, ci in zip(xyxy, confs, clsi):
             x1, y1, x2, y2 = [int(round(v)) for v in box]
             cls_name = _normalize_name(id2name(ci))
-            thr = PER_CLASS_THRESH.get(cls_name, 0.40)  # default if unknown
+            thr = PER_CLASS_THRESH.get(cls_name, 0.40)
             cand.append({
                 "raw": {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": float(sc),
                         "class_id": int(ci), "class_name": id2name(ci), "cls_norm": cls_name,
                         "thr": float(thr)}
             })
 
-    # 5) Bucket by thresholds
     high, med, low = [], [], []
     for c in cand:
         sc = c["raw"]["conf"]
@@ -184,17 +184,14 @@ async def detect(
         elif sc >= min_show:
             low.append(c)
 
-    # Fallback: ensure something to review if nothing kept
     lowered = False
     if not high and not med and topk_fallback > 0 and cand:
-        # pick top-K by score >= min_show
         tmp = sorted([z for z in cand if z["raw"]["conf"] >= min_show],
                      key=lambda z: z["raw"]["conf"], reverse=True)[:topk_fallback]
         low = tmp
         lowered = True
 
-    # 6) Draw overlays
-    canvas = base.copy()  # RGB
+    canvas = base.copy()
     scale, thick = _text_scale(W)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -210,17 +207,14 @@ async def detect(
         cv2.rectangle(canvas, (x1, ytxt - th - 4), (x1 + tw + 6, ytxt), color, -1)
         cv2.putText(canvas, label, (x1 + 3, ytxt - 4), font, scale, (0,0,0), thick, cv2.LINE_AA)
 
-    # Colors: high=green, med=orange, low=dashed gray
     for b in high: draw_box(b, (0,255,0), solid=True)
-    for b in med:  draw_box(b, (0,165,255), solid=True)   # orange (BGR)
+    for b in med:  draw_box(b, (0,165,255), solid=True)
     for b in low:  draw_box(b, (180,180,180), solid=False)
 
-    # Save
     filename = f"{uuid.uuid4()}.png"
     outpath = os.path.join(STATIC_DIR, filename)
     cv2.imwrite(outpath, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
-    # 7) Build response JSON
     def to_out(b):
         x1,y1,x2,y2 = b["raw"]["x1"], b["raw"]["y1"], b["raw"]["x2"], b["raw"]["y2"]
         conf = b["raw"]["conf"]
