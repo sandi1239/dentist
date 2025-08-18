@@ -257,3 +257,7 @@ async def detect(
 @app.get("/")
 def health():
     return {"status": "ok", "message": APP_TITLE}
+
+@app.get("/version")
+def version():
+    return {"version": "2025-08-18-02"}
