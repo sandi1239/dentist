@@ -98,11 +98,18 @@ def mode_params(mode: str):
     }.get(mode, {"iou": 0.50})
 
 def parse_color(val: str, default: Tuple[int,int,int]) -> Tuple[int,int,int]:
-    """Parse 'r,g,b' string into tuple."""
+    """
+    Parse 'r,g,b' string into an RGB tuple (0-255), clamp if needed.
+    NOTE: We draw on an **RGB** canvas and only convert to BGR at save time.
+    """
     try:
         parts = [int(x.strip()) for x in val.split(",")]
         if len(parts) == 3:
-            return tuple(parts)
+            r,g,b = parts
+            r = max(0, min(255, r))
+            g = max(0, min(255, g))
+            b = max(0, min(255, b))
+            return (r, g, b)
     except Exception:
         pass
     return default
@@ -116,16 +123,21 @@ except Exception as e:
 
 def _draw_dashed_rect(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
     x1, y1 = pt1; x2, y2 = pt2
+    # top
     for x in range(x1, x2, dash_len + gap_len):
         cv2.line(img, (x, y1), (min(x + dash_len, x2), y1), color, thickness)
+    # bottom
     for x in range(x1, x2, dash_len + gap_len):
         cv2.line(img, (x, y2), (min(x + dash_len, x2), y2), color, thickness)
+    # left
     for y in range(y1, y2, dash_len + gap_len):
         cv2.line(img, (x1, y), (x1, min(y + dash_len, y2)), color, thickness)
+    # right
     for y in range(y1, y2, dash_len + gap_len):
         cv2.line(img, (x2, y), (x2, min(y + dash_len, y2)), color, thickness)
 
 def _text_scale(img_w):
+    # scale text size based on image width
     if img_w >= 3000: return 1.0, 2
     if img_w >= 2000: return 0.8, 2
     if img_w >= 1200: return 0.7, 2
@@ -142,13 +154,17 @@ async def detect(
     min_show: float = Query(0.12, ge=0.0, le=1.0),
     topk_fallback: int = Query(3, ge=0, le=10),
     show_levels: str = Query("high,medium,low"),
-    color_high: str = Query("0,255,0", description="RGB for high confidence boxes"),
-    color_medium: str = Query("0,165,255", description="RGB for medium confidence boxes"),
-    color_low: str = Query("180,180,180", description="RGB for low confidence boxes"),
+    # IMPORTANT: defaults are **RGB**
+    color_high: str = Query("0,255,0", description="RGB for high confidence boxes (default green)"),
+    color_medium: str = Query("255,165,0", description="RGB for medium confidence boxes (default orange)"),
+    color_low: str = Query("180,180,180", description="RGB for low confidence boxes (default gray)"),
 ):
     """
-    Run detection and draw bounding boxes.
-    Box colors configurable via ?color_high=R,G,B etc.
+    Run detection and draw bounding boxes on an **RGB canvas**.
+      - High:   green solid
+      - Medium: orange solid
+      - Low:    gray dashed
+    Colors are provided/parsed as **RGB** strings 'r,g,b'. We only convert to BGR when saving.
     """
     if MODEL is None:
         raise HTTPException(500, "Model not loaded. Ensure best.pt is present.")
@@ -159,7 +175,7 @@ async def detect(
         raise HTTPException(400, f"Could not read image: {e}")
 
     pil = maybe_enhance(pil, enable=enhance)
-    base = np.array(pil)
+    base = np.array(pil)  # RGB
     H, W = base.shape[:2]
 
     iou = mode_params(mode)["iou"]
@@ -167,7 +183,7 @@ async def detect(
         res = MODEL.predict(
             source=pil,
             imgsz=imgsz,
-            conf=0.001,
+            conf=0.001,       # collect all, we filter ourselves
             iou=iou,
             device="cpu",
             agnostic_nms=True,
@@ -213,33 +229,44 @@ async def detect(
         lowered = True
 
     show_set = {s.strip().lower() for s in show_levels.split(",") if s.strip()}
-    color_high = parse_color(color_high, (0,255,0))
-    color_medium = parse_color(color_medium, (0,165,255))
-    color_low = parse_color(color_low, (180,180,180))
 
-    canvas = base.copy()
+    # Colors are RGB tuples here (we draw on RGB canvas)
+    color_high_rgb   = parse_color(color_high,   (0, 255, 0))     # green
+    color_medium_rgb = parse_color(color_medium, (255, 165, 0))   # orange
+    color_low_rgb    = parse_color(color_low,    (180, 180, 180)) # gray
+
+    canvas = base.copy()  # RGB
     scale, thick = _text_scale(W)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    def draw_box(b, color, solid=True):
+    def draw_box(b, color_rgb, solid=True):
         x1,y1,x2,y2 = b["raw"]["x1"], b["raw"]["y1"], b["raw"]["x2"], b["raw"]["y2"]
         label = f'{b["raw"]["class_name"]} {b["raw"]["conf"]:.2f}'
+        # OpenCV expects BGR for drawing, but our canvas is RGB.
+        # Convert the provided RGB color to BGR for the draw call only.
+        bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
         if solid:
-            cv2.rectangle(canvas, (x1,y1), (x2,y2), color, thickness=2)
+            cv2.rectangle(canvas, (x1,y1), (x2,y2), bgr, thickness=2)
         else:
-            _draw_dashed_rect(canvas, (x1,y1), (x2,y2), color, thickness=2)
+            _draw_dashed_rect(canvas, (x1,y1), (x2,y2), bgr, thickness=2)
         (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
         ytxt = max(0, y1 - 5)
-        cv2.rectangle(canvas, (x1, ytxt - th - 4), (x1 + tw + 6, ytxt), color, -1)
+        # label background in same color
+        cv2.rectangle(canvas,
+                      (x1, ytxt - th - 4),
+                      (x1 + tw + 6, ytxt),
+                      bgr, -1)
+        # text in black
         cv2.putText(canvas, label, (x1 + 3, ytxt - 4), font, scale, (0,0,0), thick, cv2.LINE_AA)
 
     if "high" in show_set:
-        for b in high: draw_box(b, color_high, solid=True)
+        for b in high: draw_box(b, color_high_rgb, solid=True)      # Green solid
     if "medium" in show_set:
-        for b in med:  draw_box(b, color_medium, solid=True)
+        for b in med:  draw_box(b, color_medium_rgb, solid=True)    # Orange solid
     if "low" in show_set:
-        for b in low:  draw_box(b, color_low, solid=False)
+        for b in low:  draw_box(b, color_low_rgb, solid=False)      # Gray dashed
 
+    # Save: convert RGB canvas -> BGR for OpenCV imwrite
     filename = f"{uuid.uuid4()}.png"
     outpath = os.path.join(STATIC_DIR, filename)
     cv2.imwrite(outpath, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
@@ -268,7 +295,11 @@ async def detect(
             "iou": iou, "min_show": min_show, "topk_fallback": topk_fallback,
             "per_class_thresholds": PER_CLASS_THRESH,
             "show_levels": list(show_set),
-            "colors": {"high": color_high, "medium": color_medium, "low": color_low},
+            "colors_rgb": {
+                "high": color_high_rgb,
+                "medium": color_medium_rgb,
+                "low": color_low_rgb
+            },
         },
         "debug": {"top_raw_conf_scores": top_scores, "fallback_used": lowered}
     }
@@ -280,4 +311,4 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "2025-08-18-04"}
+    return {"version": "2025-08-18-05"}
