@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# OS libs for OpenCV (headless still needs some), Pillow, etc.
+# Install system dependencies for OpenCV, Pillow, etc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -11,13 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Upgrade pip & wheels
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Install deps
+# Copy requirements
 COPY requirements.txt /app/requirements.txt
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy app
+# Copy application code
 COPY . /app
 
 EXPOSE 8000
