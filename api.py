@@ -22,20 +22,29 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 
 app = FastAPI(title=APP_TITLE)
 
-# ✅ CORS middleware so your Lovable frontend can call this API
+# ---------------- CORS ----------------
+# Explicitly allow your Lovable origins (preview + prod + project domain).
+ALLOWED_ORIGINS = [
+    "https://preview--dental-scan-analyzer.lovable.app",
+    "https://dental-scan-analyzer.lovable.app",
+    "https://bcfe2fae-0c0f-4493-96b6-4f09ed047686.lovableproject.com",
+]
+# Optionally allow any *.lovable.app or *.lovableproject.com via regex:
+ALLOW_ORIGIN_REGEX = r"^https:\/\/([a-z0-9-]+\.)?(lovable(app|project)\.com)$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # or explicitly list: "https://preview--dental-scan-analyzer.lovable.app", "https://dental-scan-analyzer.lovable.app"
-    ],
+    allow_origins=ALLOWED_ORIGINS,     # list of exact origins
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,  # plus wildcard for subdomains
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],  # includes Content-Type, Authorization, etc.
 )
 
+# Static files (annotated images). CORS middleware applies to these, too.
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ---- Per-class clinical thresholds (tune later per feedback) ----
+# ---- Per-class thresholds (tune per feedback) ----
 PER_CLASS_THRESH: Dict[str, float] = {
     "caries": 0.40,
     "bone loss": 0.45,
@@ -92,7 +101,7 @@ def mode_params(mode: str):
 
 # ---- Load model ----
 try:
-    MODEL = YOLO("best.pt")  # ensure EXACT same weights you trust
+    MODEL = YOLO("best.pt")
 except Exception as e:
     print("❌ Model load error:", e)
     MODEL = None
@@ -118,11 +127,11 @@ def _text_scale(img_w):
 async def detect(
     file: UploadFile = File(...),
     mode: Literal["balanced","high_recall","high_precision"] = Query("balanced"),
-    imgsz: int = Query(1536, ge=512, le=3072),
+    imgsz: int = Query(1024, ge=512, le=3072),  # 1024 default is friendlier on free tiers
     enhance: bool = Query(True),
-    use_augment: bool = Query(False),
-    min_show: float = Query(0.12, ge=0.0, le=1.0),
-    topk_fallback: int = Query(3, ge=0, le=10),
+    use_augment: bool = Query(False, description="Ultralytics augment=True (mild recall boost)"),
+    min_show: float = Query(0.12, ge=0.0, le=1.0, description="Minimum score to show dashed low-suggestions"),
+    topk_fallback: int = Query(3, ge=0, le=10, description="If nothing passes thresholds, show up to K low-suggestions"),
 ):
     if MODEL is None:
         raise HTTPException(500, "Model not loaded. Ensure best.pt is present and valid.")
@@ -208,7 +217,7 @@ async def detect(
         cv2.putText(canvas, label, (x1 + 3, ytxt - 4), font, scale, (0,0,0), thick, cv2.LINE_AA)
 
     for b in high: draw_box(b, (0,255,0), solid=True)
-    for b in med:  draw_box(b, (0,165,255), solid=True)
+    for b in med:  draw_box(b, (0,165,255), solid=True)   # orange (BGR)
     for b in low:  draw_box(b, (180,180,180), solid=False)
 
     filename = f"{uuid.uuid4()}.png"
